@@ -17,6 +17,7 @@ class Container implements ContainerInterface
     private $item_list = [];
     private $item_cache_list = [];
     private $no_share_list = [];
+    private $callback_list = [];
 
     public function has(string $id): bool
     {
@@ -51,6 +52,20 @@ class Container implements ContainerInterface
             }
 
             $obj = call_user_func($this->item_list[$id], ...$args);
+
+            foreach ($this->callback_list[$id] ?? [] as $callback) {
+                if (is_array($callback)) {
+                    $args2 = $this->reflectArguments(new ReflectionMethod(...$callback), [$id => $obj]);
+                } elseif (is_object($callback)) {
+                    $args2 = $this->reflectArguments(new ReflectionMethod($callback, '__invoke'), [$id => $obj]);
+                } elseif (is_string($callback) && strpos($callback, '::')) {
+                    $args2 = $this->reflectArguments(new ReflectionMethod($callback), [$id => $obj]);
+                } else {
+                    $args2 = $this->reflectArguments(new ReflectionFunction($callback), [$id => $obj]);
+                }
+                $obj = call_user_func($callback, ...$args2) ?: $obj;
+            }
+
             if (!in_array($id, $this->no_share_list)) {
                 $this->item_cache_list[$id] = $obj;
             }
@@ -60,6 +75,20 @@ class Container implements ContainerInterface
             if ($reflector->isInstantiable()) {
                 $construct = $reflector->getConstructor();
                 $obj = $reflector->newInstanceArgs($construct === null ? [] : $this->reflectArguments($construct));
+
+                foreach ($this->callback_list[$id] ?? [] as $callback) {
+                    if (is_array($callback)) {
+                        $args2 = $this->reflectArguments(new ReflectionMethod(...$callback), [$id => $obj]);
+                    } elseif (is_object($callback)) {
+                        $args2 = $this->reflectArguments(new ReflectionMethod($callback, '__invoke'), [$id => $obj]);
+                    } elseif (is_string($callback) && strpos($callback, '::')) {
+                        $args2 = $this->reflectArguments(new ReflectionMethod($callback), [$id => $obj]);
+                    } else {
+                        $args2 = $this->reflectArguments(new ReflectionFunction($callback), [$id => $obj]);
+                    }
+                    $obj = call_user_func($callback, ...$args2) ?: $obj;
+                }
+
                 if (!in_array($id, $this->no_share_list)) {
                     $this->item_cache_list[$id] = $obj;
                 }
@@ -90,29 +119,41 @@ class Container implements ContainerInterface
         return $this;
     }
 
-    public function reflectArguments(ReflectionFunctionAbstract $method, array $args = []): array
+    public function onInstance(string $id, callable $callback)
     {
-        return array_map(function (ReflectionParameter $param) use ($method, $args) {
+        if (!isset($this->callback_list[$id])) {
+            $this->callback_list[$id] = [];
+        }
+        $this->callback_list[$id][] = $callback;
+    }
 
-            $name = $param->getName();
-            if (array_key_exists($name, $args)) {
-                return $args[$name];
-            }
-
+    public function reflectArguments(ReflectionFunctionAbstract $method, array $default = []): array
+    {
+        return array_map(function (ReflectionParameter $param) use ($method, $default) {
             $type = $param->getType();
-
             if ($type === null) {
-                if ($this->has($param->getName())) {
-                    return $this->get($param->getName());
+                $name = $param->getName();
+
+                if (array_key_exists($name, $default)) {
+                    return $default[$name];
+                }
+
+                if ($this->has($name)) {
+                    return $this->get($name);
                 }
             } else {
+                $type_name = $type->getName();
+
+                if (array_key_exists($type_name, $default)) {
+                    return $default[$type_name];
+                }
+
                 /**
                  * @var ReflectionNamedType $type
                  */
                 if (!$type->isBuiltin()) {
-                    if ($this->has($type->getName())) {
-                        $result = $this->get($type->getName());
-                        $type_name = $type->getName();
+                    if ($this->has($type_name)) {
+                        $result = $this->get($type_name);
                         if ($result instanceof $type_name) {
                             return $result;
                         }
