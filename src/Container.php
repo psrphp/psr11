@@ -4,12 +4,11 @@ declare(strict_types=1);
 
 namespace PsrPHP\Psr11;
 
+use Closure;
 use OutOfBoundsException;
 use Psr\Container\ContainerInterface;
 use ReflectionClass;
 use ReflectionFunction;
-use ReflectionFunctionAbstract;
-use ReflectionMethod;
 use ReflectionParameter;
 
 class Container implements ContainerInterface
@@ -24,12 +23,10 @@ class Container implements ContainerInterface
         if (array_key_exists($id, $this->item_list)) {
             return true;
         }
-        if ($reflector = $this->getReflectionClass($id)) {
-            if ($reflector->isInstantiable()) {
-                return true;
-            }
+        if (!class_exists($id)) {
+            return false;
         }
-        return false;
+        return (new ReflectionClass($id))->isInstantiable();
     }
 
     public function get(string $id, bool $new = false)
@@ -40,17 +37,7 @@ class Container implements ContainerInterface
             }
         }
         if (array_key_exists($id, $this->item_list)) {
-
-            if (is_array($this->item_list[$id])) {
-                $args = $this->reflectArguments(new ReflectionMethod(...$this->item_list[$id]));
-            } elseif (is_object($this->item_list[$id])) {
-                $args = $this->reflectArguments(new ReflectionMethod($this->item_list[$id], '__invoke'));
-            } elseif (is_string($this->item_list[$id]) && strpos($this->item_list[$id], '::')) {
-                $args = $this->reflectArguments(new ReflectionMethod($this->item_list[$id]));
-            } else {
-                $args = $this->reflectArguments(new ReflectionFunction($this->item_list[$id]));
-            }
-
+            $args = $this->reflectArguments($this->item_list[$id]);
             $obj = call_user_func($this->item_list[$id], ...$args);
 
             if (!in_array($id, $this->no_share_list)) {
@@ -58,39 +45,25 @@ class Container implements ContainerInterface
             }
 
             foreach ($this->callback_list[$id] ?? [] as $callback) {
-                if (is_array($callback)) {
-                    $args2 = $this->reflectArguments(new ReflectionMethod(...$callback), [$id => &$obj]);
-                } elseif (is_object($callback)) {
-                    $args2 = $this->reflectArguments(new ReflectionMethod($callback, '__invoke'), [$id => &$obj]);
-                } elseif (is_string($callback) && strpos($callback, '::')) {
-                    $args2 = $this->reflectArguments(new ReflectionMethod($callback), [$id => &$obj]);
-                } else {
-                    $args2 = $this->reflectArguments(new ReflectionFunction($callback), [$id => &$obj]);
-                }
+                $args2 = $this->reflectArguments($callback, [$id => &$obj]);
                 $obj = call_user_func($callback, ...$args2) ?: $obj;
             }
 
             return $obj;
         }
-        if ($reflector = $this->getReflectionClass($id)) {
+
+        if (class_exists($id)) {
+            $reflector = new ReflectionClass($id);
             if ($reflector->isInstantiable()) {
-                $construct = $reflector->getConstructor();
-                $obj = $reflector->newInstanceArgs($construct === null ? [] : $this->reflectArguments($construct));
+                $arg = $reflector->getConstructor() === null ? [] : $this->reflectArguments([$id, '__construct']);
+                $obj = $reflector->newInstanceArgs($arg);
 
                 if (!in_array($id, $this->no_share_list)) {
                     $this->item_cache_list[$id] = &$obj;
                 }
 
                 foreach ($this->callback_list[$id] ?? [] as $callback) {
-                    if (is_array($callback)) {
-                        $args2 = $this->reflectArguments(new ReflectionMethod(...$callback), [$id => &$obj]);
-                    } elseif (is_object($callback)) {
-                        $args2 = $this->reflectArguments(new ReflectionMethod($callback, '__invoke'), [$id => &$obj]);
-                    } elseif (is_string($callback) && strpos($callback, '::')) {
-                        $args2 = $this->reflectArguments(new ReflectionMethod($callback), [$id => &$obj]);
-                    } else {
-                        $args2 = $this->reflectArguments(new ReflectionFunction($callback), [$id => &$obj]);
-                    }
+                    $args2 = $this->reflectArguments($callback, [$id => &$obj]);
                     $obj = call_user_func($callback, ...$args2) ?: $obj;
                 }
 
@@ -129,19 +102,27 @@ class Container implements ContainerInterface
         $this->callback_list[$id][] = $callback;
     }
 
-    public function reflectArguments(ReflectionFunctionAbstract $method, array $default = []): array
+    public function reflectArguments($callable, array $default = []): array
     {
-        return array_map(function (ReflectionParameter $param) use ($method, $default) {
+        if (is_array($callable) && is_string($callable[0]) && class_exists($callable[0])) {
+            $reflect = new ReflectionClass($callable[0]);
+            $params = $reflect->getMethod($callable[1])->getParameters();
+        } else {
+            $reflect = new ReflectionFunction(Closure::fromCallable($callable));
+            $params = $reflect->getParameters();
+        }
+
+        return array_map(function (ReflectionParameter $param) use ($reflect, $default) {
             $type = $param->getType();
             if ($type === null) {
-                $name = $param->getName();
+                $param_name = $param->getName();
 
-                if (array_key_exists($name, $default)) {
-                    return $default[$name];
+                if (array_key_exists($param_name, $default)) {
+                    return $default[$param_name];
                 }
 
-                if ($this->has($name)) {
-                    return $this->get($name);
+                if ($this->has($param_name)) {
+                    return $this->get($param_name);
                 }
             } else {
                 $type_name = $type->getName();
@@ -150,9 +131,6 @@ class Container implements ContainerInterface
                     return $default[$type_name];
                 }
 
-                /**
-                 * @var ReflectionNamedType $type
-                 */
                 if (!$type->isBuiltin()) {
                     if ($this->has($type_name)) {
                         $result = $this->get($type_name);
@@ -174,22 +152,9 @@ class Container implements ContainerInterface
             throw new OutOfBoundsException(sprintf(
                 'Unable to resolve a value for parameter `$%s` at %s::%s',
                 $param->getName(),
-                $method->getFileName(),
-                $method->getName()
+                $reflect->getFileName(),
+                $reflect->getName()
             ));
-        }, $method->getParameters());
-    }
-
-    private function getReflectionClass(string $id): ?ReflectionClass
-    {
-        static $reflectors = [];
-        if (!isset($reflectors[$id])) {
-            if (class_exists($id)) {
-                $reflectors[$id] = new ReflectionClass($id);
-            } else {
-                return null;
-            }
-        }
-        return $reflectors[$id];
+        }, $params);
     }
 }
